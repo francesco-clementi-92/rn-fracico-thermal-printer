@@ -6,6 +6,6 @@
     "release": true
   },
   "hooks": {
-    "before:init": ["npm run prepare"]
+    "before:init": ["npm run build"]
   }
 }
