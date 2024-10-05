@@ -12,6 +12,7 @@ var BufferHelper = /** @class */ (function () {
             _this.size = 0;
             return _this;
         };
+        //@ts-ignore
         this.toBuffer = function () { return Buffer.concat(_this.buffers, _this.size); };
         this.toString = function (encoding) {
             return _this.toBuffer().toString(encoding);

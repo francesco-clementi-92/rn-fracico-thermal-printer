@@ -24,7 +24,7 @@ export default class BufferHelper {
     this.size = 0;
     return this;
   };
-
+  //@ts-ignore
   toBuffer = (): Buffer => Buffer.concat(this.buffers, this.size);
 
   toString = (encoding: BufferEncoding): string =>

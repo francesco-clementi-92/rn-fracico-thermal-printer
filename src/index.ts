@@ -348,7 +348,7 @@ const BLEPrinter = {
       RNBLEPrinter.printRawData(
         processedText.text,
         processedText.opts,
-        function (error) {
+        function (error: any) {
           return console.warn(error);
         }
       );
@@ -421,7 +421,7 @@ const NetPrinter = {
           (error: Error) => reject(error)
         );
       } catch (error) {
-        reject(error?.message || `Connect to ${host} fail`);
+        reject(error || `Connect to ${host} fail`);
       }
     }),
 

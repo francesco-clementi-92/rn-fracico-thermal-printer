@@ -74,29 +74,32 @@ export const processColumnText = (
   let rest_texts: [string, string, string] = ["", "", ""];
   let result = "";
   texts.map((text, idx) => {
-    const columnWidthAtRow = Math.round(columnWidth?.[idx]);
-    if (text.length >= columnWidth[idx]) {
-      const processedText = processNewLine(text, columnWidthAtRow);
-      result +=
-        (columnStyle?.[idx] ?? "") +
-        processAlignText(
-          processedText.text,
-          columnWidthAtRow - processedText.text.length,
-          columnAlignment[idx]
-        ) +
-        (idx !== 2 ? " " : "");
-      rest_texts[idx] = processedText.text_tail;
-    } else {
-      result +=
-        (columnStyle?.[idx] ?? "") +
-        processAlignText(
-          text.trim(),
-          columnWidthAtRow - text.length,
-          columnAlignment[idx]
-        ) +
-        (idx !== 2 ? " " : "");
+    if (columnWidth && columnAlignment && columnWidth[idx] && columnAlignment[idx]) {
+      const columnWidthAtRow = Math.round(columnWidth?.[idx]);
+      if (text.length >= columnWidth[idx]) {
+        const processedText = processNewLine(text, columnWidthAtRow);
+        result +=
+          (columnStyle?.[idx] ?? "") +
+          processAlignText(
+            processedText.text,
+            columnWidthAtRow - processedText.text.length,
+            columnAlignment[idx]
+          ) +
+          (idx !== 2 ? " " : "");
+        rest_texts[idx] = processedText.text_tail;
+      } else {
+        result +=
+          (columnStyle?.[idx] ?? "") +
+          processAlignText(
+            text.trim(),
+            columnWidthAtRow - text.length,
+            columnAlignment[idx]
+          ) +
+          (idx !== 2 ? " " : "");
+      }
     }
   });
+  
   const index_nonEmpty = rest_texts.findIndex((rest_text) => rest_text != "");
   if (index_nonEmpty !== -1) {
     result +=

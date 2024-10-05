@@ -38,7 +38,11 @@ const options_controller = {
   tailingLine: line_bytes,
 };
 
-const controller = {
+interface Controller {
+  [key: string]: Buffer;
+}
+
+const controller: Controller = {
   "<M>": m_start_bytes,
   "</M>": m_end_bytes,
   "<B>": b_start_bytes,
@@ -88,7 +92,7 @@ export function exchange_text(text: string, options: IOptions): Buffer {
         temp = "";
         // add bytes for changing font and justifying text
         for (const tag in controller) {
-          if (text.substring(i, i + tag.length) === tag) {
+          if (text.substring(i, i + tag.length) === tag && controller[tag]) {
             bytes.concat(controller[tag]);
             i += tag.length - 1;
           }
@@ -108,7 +112,9 @@ export function exchange_text(text: string, options: IOptions): Buffer {
   temp.length && bytes.concat(iconv.encode(temp, m_options.encoding));
 
   // check for "encoding" flag
+  //@ts-ignore
   if (typeof m_options["encoding"] === "boolean" && options_controller["encoding"]) {
+    //@ts-ignore
     bytes.concat(options_controller["encoding"]);
   }
 

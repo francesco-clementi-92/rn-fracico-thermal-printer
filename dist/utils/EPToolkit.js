@@ -71,26 +71,28 @@ export function exchange_text(text, options) {
                 temp = "";
                 // add bytes for changing font and justifying text
                 for (var tag in controller) {
-                    if (text.substring(i, i + tag.length) === tag) {
+                    if (text.substring(i, i + tag.length) === tag && controller[tag]) {
                         bytes.concat(controller[tag]);
                         i += tag.length - 1;
                     }
                 }
                 break;
             case "\n":
-                temp = "".concat(temp).concat(ch);
+                temp = "" + temp + ch;
                 bytes.concat(iconv.encode(temp, m_options.encoding));
                 bytes.concat(reset_bytes);
                 temp = "";
                 break;
             default:
-                temp = "".concat(temp).concat(ch);
+                temp = "" + temp + ch;
                 break;
         }
     }
     temp.length && bytes.concat(iconv.encode(temp, m_options.encoding));
     // check for "encoding" flag
+    //@ts-ignore
     if (typeof m_options["encoding"] === "boolean" && options_controller["encoding"]) {
+        //@ts-ignore
         bytes.concat(options_controller["encoding"]);
     }
     // check for "tailingLine" flag
