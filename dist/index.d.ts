@@ -93,6 +93,7 @@ declare const BLEPrinter: {
      * @param text
      */
     printRaw: (text: string, onSuccess: (e: string) => void, onError: (e: string) => void) => void;
+    isBluetoothReady: () => Promise<unknown>;
     /**
      * `columnWidth`
      * 80mm => 46 character

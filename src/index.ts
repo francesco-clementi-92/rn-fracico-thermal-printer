@@ -342,12 +342,12 @@ const BLEPrinter = {
    * @param text
    */
   printRaw: (text: string, onSuccess: (e:string) => void, onError: (e:string) => void): void => {
-    if (Platform.OS === "ios") {
-      const processedText = textPreprocessingIOS(text, false, false);
-      return RNBLEPrinter.printRawData(processedText.text, processedText.opts,onSuccess, onError);
-    } else {
-      RNBLEPrinter.printRawData(text, onSuccess, onError);
-    }
+    return RNBLEPrinter.printRawData(text, onSuccess, onError);
+  },
+  isBluetoothReady: function () {
+    return new Promise(function (resolve) {
+        return RNBLEPrinter.isBluetoothReady(function (isReady: boolean) { return resolve(isReady); });
+    });
   },
   /**
    * `columnWidth`
