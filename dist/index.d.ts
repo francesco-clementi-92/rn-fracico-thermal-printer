@@ -92,7 +92,7 @@ declare const BLEPrinter: {
      * android print with encoder
      * @param text
      */
-    printRaw: (text: string) => void;
+    printRaw: (text: string, onSuccess: (e: string) => void, onError: (e: string) => void) => void;
     /**
      * `columnWidth`
      * 80mm => 46 character
@@ -123,7 +123,7 @@ declare const NetPrinter: {
      * Android print with encoder
      * @param text
      */
-    printRaw: (text: string) => void;
+    printRaw: (text: string, onSuccess: (s: string) => void, onError: (s: string) => void) => void;
     /**
      * `columnWidth`
      * 80mm => 46 character

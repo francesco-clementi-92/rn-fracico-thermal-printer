@@ -212,7 +212,7 @@ public class NetPrinterAdapter implements PrinterAdapter {
     }
 
     @Override
-    public void printRawData(String rawBase64Data, Callback errorCallback) {
+    public void printRawData(String rawBase64Data, Callback successCallback, Callback errorCallback) {
         if (this.mSocket == null) {
             errorCallback.invoke("Net connection is not built, may be you forgot to connectPrinter");
             return;

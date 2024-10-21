@@ -1,9 +1,13 @@
 package com.pinmi.react.printer.adapter;
+
 import static com.pinmi.react.printer.adapter.UtilsImage.getPixelsSlow;
 import static com.pinmi.react.printer.adapter.UtilsImage.recollectSlice;
+
+import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.util.Base64;
@@ -24,12 +28,16 @@ import java.net.URL;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+
 import android.graphics.BitmapFactory;
+
+import androidx.core.app.ActivityCompat;
+
 /**
  * Created by xiesubin on 2017/9/21.
  */
 
-public class BLEPrinterAdapter implements PrinterAdapter{
+public class BLEPrinterAdapter implements PrinterAdapter {
 
 
     private static BLEPrinterAdapter mInstance;
@@ -44,18 +52,18 @@ public class BLEPrinterAdapter implements PrinterAdapter{
     private ReactApplicationContext mContext;
 
     private final static char ESC_CHAR = 0x1B;
-    private static final byte[] SELECT_BIT_IMAGE_MODE = { 0x1B, 0x2A, 33 };
-    private final static byte[] SET_LINE_SPACE_24 = new byte[] { ESC_CHAR, 0x33, 24 };
-    private final static byte[] SET_LINE_SPACE_32 = new byte[] { ESC_CHAR, 0x33, 32 };
-    private final static byte[] LINE_FEED = new byte[] { 0x0A };
-    private static final byte[] CENTER_ALIGN = { 0x1B, 0X61, 0X31 };
+    private static final byte[] SELECT_BIT_IMAGE_MODE = {0x1B, 0x2A, 33};
+    private final static byte[] SET_LINE_SPACE_24 = new byte[]{ESC_CHAR, 0x33, 24};
+    private final static byte[] SET_LINE_SPACE_32 = new byte[]{ESC_CHAR, 0x33, 32};
+    private final static byte[] LINE_FEED = new byte[]{0x0A};
+    private static final byte[] CENTER_ALIGN = {0x1B, 0X61, 0X31};
 
 
-
-    private BLEPrinterAdapter(){}
+    private BLEPrinterAdapter() {
+    }
 
     public static BLEPrinterAdapter getInstance() {
-        if(mInstance == null) {
+        if (mInstance == null) {
             mInstance = new BLEPrinterAdapter();
         }
         return mInstance;
@@ -65,14 +73,14 @@ public class BLEPrinterAdapter implements PrinterAdapter{
     public void init(ReactApplicationContext reactContext, Callback successCallback, Callback errorCallback) {
         this.mContext = reactContext;
         BluetoothAdapter bluetoothAdapter = getBTAdapter();
-        if(bluetoothAdapter == null) {
+        if (bluetoothAdapter == null) {
             errorCallback.invoke("No bluetooth adapter available");
             return;
         }
-        if(!bluetoothAdapter.isEnabled()) {
+        if (!bluetoothAdapter.isEnabled()) {
             errorCallback.invoke("bluetooth adapter is not enabled");
             return;
-        }else{
+        } else {
             successCallback.invoke();
         }
 
@@ -86,7 +94,7 @@ public class BLEPrinterAdapter implements PrinterAdapter{
     public List<PrinterDevice> getDeviceList(Callback errorCallback) {
         BluetoothAdapter bluetoothAdapter = getBTAdapter();
         List<PrinterDevice> printerDevices = new ArrayList<>();
-        if(bluetoothAdapter == null) {
+        if (bluetoothAdapter == null) {
             errorCallback.invoke("No bluetooth adapter available");
             return printerDevices;
         }
@@ -94,6 +102,7 @@ public class BLEPrinterAdapter implements PrinterAdapter{
             errorCallback.invoke("bluetooth is not enabled");
             return printerDevices;
         }
+
         Set<BluetoothDevice> pairedDevices = getBTAdapter().getBondedDevices();
         for (BluetoothDevice device : pairedDevices) {
             printerDevices.add(new BLEPrinterDevice(device));
@@ -104,7 +113,7 @@ public class BLEPrinterAdapter implements PrinterAdapter{
     @Override
     public void selectDevice(PrinterDeviceId printerDeviceId, Callback successCallback, Callback errorCallback) {
         BluetoothAdapter bluetoothAdapter = getBTAdapter();
-        if(bluetoothAdapter == null) {
+        if (bluetoothAdapter == null) {
             errorCallback.invoke("No bluetooth adapter available");
             return;
         }
@@ -112,22 +121,22 @@ public class BLEPrinterAdapter implements PrinterAdapter{
             errorCallback.invoke("bluetooth is not enabled");
             return;
         }
-        BLEPrinterDeviceId blePrinterDeviceId = (BLEPrinterDeviceId)printerDeviceId;
-        if(this.mBluetoothDevice != null){
-            if(this.mBluetoothDevice.getAddress().equals(blePrinterDeviceId.getInnerMacAddress()) && this.mBluetoothSocket != null){
+        BLEPrinterDeviceId blePrinterDeviceId = (BLEPrinterDeviceId) printerDeviceId;
+        if (this.mBluetoothDevice != null) {
+            if (this.mBluetoothDevice.getAddress().equals(blePrinterDeviceId.getInnerMacAddress()) && this.mBluetoothSocket != null) {
                 Log.v(LOG_TAG, "do not need to reconnect");
                 successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
                 return;
-            }else{
+            } else {
                 closeConnectionIfExists();
             }
         }
         Set<BluetoothDevice> pairedDevices = getBTAdapter().getBondedDevices();
 
         for (BluetoothDevice device : pairedDevices) {
-            if(device.getAddress().equals(blePrinterDeviceId.getInnerMacAddress())){
+            if (device.getAddress().equals(blePrinterDeviceId.getInnerMacAddress())) {
 
-                try{
+                try {
                     connectBluetoothDevice(device, false);
                     successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
                     return;
@@ -156,7 +165,7 @@ public class BLEPrinterAdapter implements PrinterAdapter{
         if (retry) {
             try {
                 this.mBluetoothSocket = (BluetoothSocket) device.getClass()
-                        .getMethod("createRfcommSocket", new Class[] { int.class }).invoke(device, 1);
+                        .getMethod("createRfcommSocket", new Class[]{int.class}).invoke(device, 1);
             } catch (Exception e) {
                 e.printStackTrace();
                 throw new IOException("Failed to create RFComm socket using reflection", e);
@@ -199,7 +208,7 @@ public class BLEPrinterAdapter implements PrinterAdapter{
     }
 
     @Override
-    public void printRawData(String rawBase64Data, Callback errorCallback) {
+    public void printRawData(String rawBase64Data, Callback successCallback, Callback errorCallback) {
         if(this.mBluetoothSocket == null){
             errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
             return;
@@ -215,9 +224,15 @@ public class BLEPrinterAdapter implements PrinterAdapter{
                     OutputStream printerOutputStream = socket.getOutputStream();
                     printerOutputStream.write(bytes, 0, bytes.length);
                     printerOutputStream.flush();
+                    if (successCallback != null) {
+                        successCallback.invoke("Done");
+                    }
                 }catch (IOException e){
                     Log.e(LOG_TAG, "failed to print data" + rawData);
                     e.printStackTrace();
+                    if (errorCallback != null) {
+                        errorCallback.invoke("Error printing: " + e.getMessage());
+                    }
                 }
 
             }

@@ -296,16 +296,8 @@ var BLEPrinter = {
      * android print with encoder
      * @param text
      */
-    printRaw: function (text) {
-        if (Platform.OS === "ios") {
-            var processedText = textPreprocessingIOS(text, false, false);
-            RNBLEPrinter.printRawData(processedText.text, processedText.opts, function (error) {
-                return console.warn(error);
-            });
-        }
-        else {
-            RNBLEPrinter.printRawData(text, function (error) { return console.warn(error); });
-        }
+    printRaw: function (text, onSuccess, onError) {
+        return RNBLEPrinter.printRawData(text, onSuccess, onError);
     },
     /**
      * `columnWidth`
@@ -427,12 +419,8 @@ var NetPrinter = {
      * Android print with encoder
      * @param text
      */
-    printRaw: function (text) {
-        if (Platform.OS === "ios") {
-        }
-        else {
-            RNNetPrinter.printRawData(text, function (error) { return console.warn(error); });
-        }
+    printRaw: function (text, onSuccess, onError) {
+        return RNNetPrinter.printRawData(text, onSuccess, onError);
     },
     /**
      * `columnWidth`

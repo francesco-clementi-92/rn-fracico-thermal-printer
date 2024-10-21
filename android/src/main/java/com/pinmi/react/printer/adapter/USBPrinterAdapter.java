@@ -222,7 +222,7 @@ public class USBPrinterAdapter implements PrinterAdapter {
     }
 
 
-    public void printRawData(String data, Callback errorCallback) {
+    public void printRawData(String data, Callback successCallback, Callback errorCallback) {
         final String rawData = data;
         Log.v(LOG_TAG, "start to print raw data " + data);
         boolean isConnected = openConnection();
