@@ -6,10 +6,6 @@
 
 @interface RNBLEPrinter () <CBCentralManagerDelegate>
 @property (nonatomic, strong) CBCentralManager *bluetoothManager;
-@property (nonatomic, strong) dispatch_queue_t bluetoothQueue;
-@property (nonatomic, strong) NSMutableArray<Printer *> *discoveredPrinters;
-@property (nonatomic, weak) Printer *connectedPrinter; // Weak reference to avoid retain cycles
-@property (nonatomic, assign) BOOL bluetoothReady; // Property to track Bluetooth readiness
 @end
 
 @implementation RNBLEPrinter
@@ -25,9 +21,8 @@ RCT_EXPORT_METHOD(init:(RCTResponseSenderBlock)successCallback
                   fail:(RCTResponseSenderBlock)errorCallback) {
     @try {
         _printerArray = [NSMutableArray new];
-        m_printer = [[NSObject alloc] init];
+        m_printer = nil;
         self.bluetoothManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil];
-        self.bluetoothReady = NO;
         successCallback(@[@"Init successful"]);
     } @catch (NSException *exception) {
         errorCallback(@[@"No Bluetooth adapter available"]);
@@ -37,42 +32,55 @@ RCT_EXPORT_METHOD(init:(RCTResponseSenderBlock)successCallback
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
     NSLog(@"Bluetooth state updated: %ld", (long)central.state);
     if (central.state == CBManagerStatePoweredOn) {
-        self.bluetoothReady = YES; // Set ready to YES
         NSLog(@"Bluetooth is powered on.");
-        
-        // Start scanning for printers now that Bluetooth is ready
-        [[PrinterSDK defaultPrinterSDK] scanPrintersWithCompletion:^(Printer* printer) {
-            // Add printer handling code here if needed
-        }];
     } else {
-        self.bluetoothReady = NO; // Set ready to NO for other states
         NSLog(@"Bluetooth is not powered on. Current state: %ld", (long)central.state);
     }
 }
 
-
 RCT_EXPORT_METHOD(isBluetoothReady:(RCTResponseSenderBlock)callback) {
     CBManagerState state = self.bluetoothManager.state;
     BOOL isReady = (state == CBManagerStatePoweredOn);
-    NSLog(@"isBluetoothReady called, Bluetooth state: %ld, bluetoothReady: %@", state, isReady ? @"YES" : @"NO");
     callback(@[@(isReady)]);
 }
-
 
 RCT_EXPORT_METHOD(getDeviceList:(RCTResponseSenderBlock)successCallback
                   fail:(RCTResponseSenderBlock)errorCallback) {
     @try {
-        !_printerArray ? [NSException raise:@"Null pointer exception" format:@"Must call init function first"] : nil;
-        [[PrinterSDK defaultPrinterSDK] scanPrintersWithCompletion:^(Printer* printer){
-            [_printerArray addObject:printer];
-            NSMutableArray *mapped = [NSMutableArray arrayWithCapacity:[_printerArray count]];
-            [_printerArray enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
-                NSDictionary *dict = @{ @"device_name" : printer.name, @"inner_mac_address" : printer.UUIDString};
-                [mapped addObject:dict];
-            }];
-            NSMutableArray *uniquearray = (NSMutableArray *)[[NSSet setWithArray:mapped] allObjects];;
-            successCallback(@[uniquearray]);
+        if (!_printerArray) {
+            [NSException raise:@"Null pointer exception" format:@"Must call init function first"];
+        }
+
+        [_printerArray removeAllObjects];
+
+        [[PrinterSDK defaultPrinterSDK] scanPrintersWithCompletion:^(Printer* printer) {
+            if (!printer) return;
+
+            BOOL exists = NO;
+            for (Printer *existing in _printerArray) {
+                if ([existing.UUIDString isEqualToString:printer.UUIDString]) {
+                    exists = YES;
+                    break;
+                }
+            }
+            if (!exists) {
+                [_printerArray addObject:printer];
+            }
         }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[PrinterSDK defaultPrinterSDK] stopScanPrinters];
+
+            NSMutableArray *mapped = [NSMutableArray arrayWithCapacity:[_printerArray count]];
+            for (Printer *p in _printerArray) {
+                NSDictionary *dict = @{
+                    @"device_name": p.name ?: @"",
+                    @"inner_mac_address": p.UUIDString ?: @""
+                };
+                [mapped addObject:dict];
+            }
+            successCallback(@[mapped]);
+        });
     } @catch (NSException *exception) {
         errorCallback(@[exception.reason]);
     }
@@ -82,24 +90,74 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)inner_mac_address
                   success:(RCTResponseSenderBlock)successCallback
                   fail:(RCTResponseSenderBlock)errorCallback) {
     @try {
-        __block BOOL found = NO;
-        __block Printer* selectedPrinter = nil;
-        [_printerArray enumerateObjectsUsingBlock: ^(id obj, NSUInteger idx, BOOL *stop){
-            selectedPrinter = (Printer *)obj;
-            if ([inner_mac_address isEqualToString:(selectedPrinter.UUIDString)]) {
-                found = YES;
-                *stop = YES;
+        if (!_printerArray || [_printerArray count] == 0) {
+            [NSException raise:@"Invalid state" format:@"No printers discovered. Call getDeviceList first."];
+        }
+
+        Printer *selectedPrinter = nil;
+        for (Printer *p in _printerArray) {
+            if ([inner_mac_address isEqualToString:p.UUIDString]) {
+                selectedPrinter = p;
+                break;
             }
+        }
+
+        if (!selectedPrinter) {
+            [NSException raise:@"Invalid connection"
+                        format:@"Printer with address %@ not found in discovered list", inner_mac_address];
+        }
+
+        __block id connectedObserver = nil;
+        __block id disconnectedObserver = nil;
+        __block BOOL callbackInvoked = NO;
+
+        void (^cleanup)(void) = ^{
+            if (connectedObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:connectedObserver];
+                connectedObserver = nil;
+            }
+            if (disconnectedObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:disconnectedObserver];
+                disconnectedObserver = nil;
+            }
+        };
+
+        connectedObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:PrinterConnectedNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            if (callbackInvoked) return;
+            callbackInvoked = YES;
+            cleanup();
+            m_printer = selectedPrinter;
+            NSDictionary *printerInfo = @{
+                @"device_name": selectedPrinter.name ?: @"",
+                @"inner_mac_address": selectedPrinter.UUIDString ?: @""
+            };
+            successCallback(@[printerInfo]);
         }];
 
-        if (found) {
-            [[PrinterSDK defaultPrinterSDK] connectBT:selectedPrinter];
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"BLEPrinterConnected" object:nil];
-            m_printer = selectedPrinter;
-            successCallback(@[[NSString stringWithFormat:@"Connected to printer %@", selectedPrinter.name]]);
-        } else {
-            [NSException raise:@"Invalid connection" format:@"connectPrinter: Can't connect to printer %@", inner_mac_address];
-        }
+        disconnectedObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:PrinterDisconnectedNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            if (callbackInvoked) return;
+            callbackInvoked = YES;
+            cleanup();
+            errorCallback(@[[NSString stringWithFormat:@"Printer %@ disconnected during connection", inner_mac_address]]);
+        }];
+
+        [[PrinterSDK defaultPrinterSDK] connectBT:selectedPrinter];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (callbackInvoked) return;
+            callbackInvoked = YES;
+            cleanup();
+            errorCallback(@[[NSString stringWithFormat:@"Connection to printer %@ timed out", inner_mac_address]]);
+        });
+
     } @catch (NSException *exception) {
         errorCallback(@[exception.reason]);
     }
@@ -109,17 +167,95 @@ RCT_EXPORT_METHOD(printRawData:(NSString *)text
                   success:(RCTResponseSenderBlock)successCallback
                   fail:(RCTResponseSenderBlock)errorCallback) {
     @try {
-        !m_printer ? [NSException raise:@"Invalid connection" format:@"printRawData: Can't connect to printer"] : nil;
+        if (!m_printer) {
+            [NSException raise:@"Invalid connection" format:@"Not connected to a printer"];
+        }
 
-        double delayInSeconds = 2.0f;
-        dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-        dispatch_after(popTime, dispatch_get_main_queue(), ^(void)
-        {
-            NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:text options:0];
-            NSString *decodedString = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
-            [[PrinterSDK defaultPrinterSDK] printText:decodedString];
-            successCallback(@[@"PRINTED"]);
+        NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:text options:0];
+
+        if (decodedData && decodedData.length > 0) {
+            NSMutableString *hexString = [NSMutableString stringWithCapacity:decodedData.length * 2];
+            const unsigned char *bytes = decodedData.bytes;
+            for (NSUInteger i = 0; i < decodedData.length; i++) {
+                [hexString appendFormat:@"%02x", bytes[i]];
+            }
+            [[PrinterSDK defaultPrinterSDK] sendHex:hexString];
+        } else {
+            [[PrinterSDK defaultPrinterSDK] printText:text];
+        }
+
+        if (successCallback) {
+            successCallback(@[@"Done"]);
+        }
+    } @catch (NSException *exception) {
+        if (errorCallback) {
+            errorCallback(@[exception.reason]);
+        }
+    }
+}
+
+RCT_EXPORT_METHOD(printImageData:(NSString *)imageUrl
+                  opts:(NSDictionary *)opts
+                  fail:(RCTResponseSenderBlock)errorCallback) {
+    @try {
+        if (!m_printer) {
+            [NSException raise:@"Invalid connection" format:@"Not connected to a printer"];
+        }
+
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @try {
+                NSURL *url = [NSURL URLWithString:imageUrl];
+                NSData *imageData = [NSData dataWithContentsOfURL:url];
+                if (!imageData) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        errorCallback(@[@"Failed to download image"]);
+                    });
+                    return;
+                }
+
+                UIImage *image = [UIImage imageWithData:imageData];
+                if (!image) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        errorCallback(@[@"Failed to create image from downloaded data"]);
+                    });
+                    return;
+                }
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [[PrinterSDK defaultPrinterSDK] printImage:image];
+                });
+            } @catch (NSException *exception) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    errorCallback(@[exception.reason]);
+                });
+            }
         });
+    } @catch (NSException *exception) {
+        errorCallback(@[exception.reason]);
+    }
+}
+
+RCT_EXPORT_METHOD(printImageBase64:(NSString *)base64Data
+                  opts:(NSDictionary *)opts
+                  fail:(RCTResponseSenderBlock)errorCallback) {
+    @try {
+        if (!m_printer) {
+            [NSException raise:@"Invalid connection" format:@"Not connected to a printer"];
+        }
+
+        NSData *imageData = [[NSData alloc] initWithBase64EncodedString:base64Data options:0];
+        if (!imageData) {
+            errorCallback(@[@"Failed to decode base64 image data"]);
+            return;
+        }
+
+        UIImage *image = [UIImage imageWithData:imageData];
+        if (!image) {
+            errorCallback(@[@"Failed to create image from decoded data"]);
+            return;
+        }
+
+        [[PrinterSDK defaultPrinterSDK] printImage:image];
     } @catch (NSException *exception) {
         errorCallback(@[exception.reason]);
     }
@@ -127,13 +263,13 @@ RCT_EXPORT_METHOD(printRawData:(NSString *)text
 
 RCT_EXPORT_METHOD(closeConn) {
     @try {
-        !m_printer ? [NSException raise:@"Invalid connection" format:@"closeConn: Can't connect to printer"] : nil;
-        [[PrinterSDK defaultPrinterSDK] disconnect];
-        m_printer = nil;
+        if (m_printer) {
+            [[PrinterSDK defaultPrinterSDK] disconnect];
+            m_printer = nil;
+        }
     } @catch (NSException *exception) {
-        NSLog(@"%@", exception.reason);
+        NSLog(@"closeConn error: %@", exception.reason);
     }
 }
 
 @end
-

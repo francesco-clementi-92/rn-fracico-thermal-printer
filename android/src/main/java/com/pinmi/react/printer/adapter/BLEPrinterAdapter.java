@@ -6,10 +6,20 @@ import static com.pinmi.react.printer.adapter.UtilsImage.recollectSlice;
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothSocket;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 import android.widget.Toast;
@@ -25,9 +35,12 @@ import java.net.HttpURLConnection;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.net.URL;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import android.graphics.BitmapFactory;
 
@@ -48,6 +61,11 @@ public class BLEPrinterAdapter implements PrinterAdapter {
     private BluetoothDevice mBluetoothDevice;
     private BluetoothSocket mBluetoothSocket;
 
+    private BluetoothGatt mBluetoothGatt;
+    private BluetoothGattCharacteristic mWriteCharacteristic;
+    private volatile boolean mGattConnected = false;
+    private CountDownLatch mGattConnectLatch;
+    private int mNegotiatedMtu = 23;
 
     private ReactApplicationContext mContext;
 
@@ -123,7 +141,8 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         }
         BLEPrinterDeviceId blePrinterDeviceId = (BLEPrinterDeviceId) printerDeviceId;
         if (this.mBluetoothDevice != null) {
-            if (this.mBluetoothDevice.getAddress().equals(blePrinterDeviceId.getInnerMacAddress()) && this.mBluetoothSocket != null) {
+            if (this.mBluetoothDevice.getAddress().equals(blePrinterDeviceId.getInnerMacAddress())
+                    && (this.mBluetoothSocket != null || this.mGattConnected)) {
                 Log.v(LOG_TAG, "do not need to reconnect");
                 successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
                 return;
@@ -136,18 +155,29 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         for (BluetoothDevice device : pairedDevices) {
             if (device.getAddress().equals(blePrinterDeviceId.getInnerMacAddress())) {
 
+                // Try BLE GATT first (fast for BLE printers)
+                try {
+                    connectBleGatt(device);
+                    successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
+                    return;
+                } catch (IOException bleEx) {
+                    Log.w(LOG_TAG, "BLE GATT failed, trying RFCOMM...", bleEx);
+                }
+
+                // Fall back to Classic Bluetooth (RFCOMM)
                 try {
                     connectBluetoothDevice(device, false);
                     successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
                     return;
                 } catch (IOException e) {
+                    Log.w(LOG_TAG, "RFCOMM insecure failed, trying reflection...", e);
                     try {
                         connectBluetoothDevice(device, true);
                         successCallback.invoke(new BLEPrinterDevice(this.mBluetoothDevice).toRNWritableMap());
                         return;
                     } catch (IOException er) {
-                        er.printStackTrace();
-                        errorCallback.invoke(er.getMessage());
+                        Log.e(LOG_TAG, "All connection methods failed", er);
+                        errorCallback.invoke("Failed to connect via BLE GATT and Classic BT: " + er.getMessage());
                         return;
                     }
                 }
@@ -162,6 +192,11 @@ public class BLEPrinterAdapter implements PrinterAdapter {
     private void connectBluetoothDevice(BluetoothDevice device, Boolean retry) throws IOException {
         UUID uuid = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb");
 
+        BluetoothAdapter adapter = getBTAdapter();
+        if (adapter != null) {
+            adapter.cancelDiscovery();
+        }
+
         if (retry) {
             try {
                 this.mBluetoothSocket = (BluetoothSocket) device.getClass()
@@ -175,20 +210,222 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         }
 
         try {
-            // Attempt to connect after socket creation
             this.mBluetoothSocket.connect();
         } catch (IOException e) {
-            // If connect fails, ensure socket is closed to avoid resource leakage
             try {
                 this.mBluetoothSocket.close();
             } catch (IOException closeException) {
                 closeException.printStackTrace();
             }
+            this.mBluetoothSocket = null;
             throw new IOException("Failed to connect to Bluetooth device", e);
         }
 
         this.mBluetoothDevice = device;
+    }
 
+    private final BluetoothGattCallback mGattCallback = new BluetoothGattCallback() {
+        @Override
+        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.v(LOG_TAG, "BLE GATT connected, requesting MTU...");
+                gatt.requestMtu(512);
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.w(LOG_TAG, "BLE GATT disconnected, status: " + status);
+                mGattConnected = false;
+                if (mGattConnectLatch != null) mGattConnectLatch.countDown();
+            }
+        }
+
+        @Override
+        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                mNegotiatedMtu = mtu;
+                Log.v(LOG_TAG, "BLE MTU negotiated: " + mtu);
+            } else {
+                Log.w(LOG_TAG, "MTU negotiation failed, using default");
+            }
+            gatt.discoverServices();
+        }
+
+        @Override
+        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                BluetoothGattCharacteristic fallback = null;
+
+                for (BluetoothGattService service : gatt.getServices()) {
+                    UUID serviceUuid = service.getUuid();
+                    boolean isStandardService = (serviceUuid.getMostSignificantBits() & 0xFFFF00000000L)
+                            == 0x180000000000L
+                            && serviceUuid.getLeastSignificantBits() == 0x800000805f9b34fbL;
+
+                    for (BluetoothGattCharacteristic c : service.getCharacteristics()) {
+                        int props = c.getProperties();
+                        boolean writable = (props & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                                || (props & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0;
+                        if (!writable) continue;
+
+                        Log.v(LOG_TAG, "Writable characteristic: " + c.getUuid()
+                                + " in service: " + serviceUuid
+                                + (isStandardService ? " (standard)" : " (vendor)"));
+
+                        if (!isStandardService) {
+                            mWriteCharacteristic = c;
+                            mGattConnected = true;
+                            break;
+                        } else if (fallback == null) {
+                            fallback = c;
+                        }
+                    }
+                    if (mWriteCharacteristic != null) break;
+                }
+
+                if (mWriteCharacteristic == null && fallback != null) {
+                    Log.w(LOG_TAG, "No vendor characteristic found, using standard fallback: " + fallback.getUuid());
+                    mWriteCharacteristic = fallback;
+                    mGattConnected = true;
+                }
+
+                if (mWriteCharacteristic != null) {
+                    Log.v(LOG_TAG, "Selected write characteristic: " + mWriteCharacteristic.getUuid());
+                }
+            } else {
+                Log.e(LOG_TAG, "Service discovery failed, status: " + status);
+            }
+            if (mGattConnectLatch != null) mGattConnectLatch.countDown();
+        }
+    };
+
+    private void connectBleGatt(BluetoothDevice bondedDevice) throws IOException {
+        BluetoothAdapter adapter = getBTAdapter();
+        if (adapter == null) {
+            throw new IOException("No bluetooth adapter");
+        }
+        adapter.cancelDiscovery();
+
+        final String targetAddress = bondedDevice.getAddress();
+
+        // Step 1: Scan for the device via BLE to get a proper LE-aware BluetoothDevice
+        BluetoothDevice bleDevice = scanForBleDevice(adapter, targetAddress);
+
+        // Step 2: Connect via GATT on the main thread (required by some Samsung devices)
+        mGattConnectLatch = new CountDownLatch(1);
+        mGattConnected = false;
+        mWriteCharacteristic = null;
+        mNegotiatedMtu = 23;
+
+        final BluetoothDevice deviceToConnect = bleDevice != null ? bleDevice : bondedDevice;
+        Log.v(LOG_TAG, "Connecting GATT to " + deviceToConnect.getAddress()
+                + (bleDevice != null ? " (discovered via BLE scan)" : " (from bonded list)"));
+
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                mBluetoothGatt = deviceToConnect.connectGatt(
+                        mContext, false, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+            }
+        });
+
+        try {
+            if (!mGattConnectLatch.await(15, TimeUnit.SECONDS)) {
+                closeGattIfExists();
+                throw new IOException("BLE GATT connection timed out");
+            }
+        } catch (InterruptedException e) {
+            closeGattIfExists();
+            throw new IOException("BLE GATT connection interrupted", e);
+        }
+
+        if (!mGattConnected || mWriteCharacteristic == null) {
+            closeGattIfExists();
+            throw new IOException("Failed to establish BLE GATT connection or no writable characteristic found");
+        }
+
+        this.mBluetoothDevice = deviceToConnect;
+        Log.v(LOG_TAG, "BLE GATT connected successfully, MTU: " + mNegotiatedMtu);
+    }
+
+    private BluetoothDevice scanForBleDevice(BluetoothAdapter adapter, String targetAddress) {
+        BluetoothLeScanner scanner = adapter.getBluetoothLeScanner();
+        if (scanner == null) {
+            Log.w(LOG_TAG, "BLE scanner not available");
+            return null;
+        }
+
+        // Get the bonded device name to use as fallback matching
+        String bondedDeviceName = null;
+        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+        for (BluetoothDevice d : bonded) {
+            if (d.getAddress().equals(targetAddress)) {
+                bondedDeviceName = d.getName();
+                break;
+            }
+        }
+        final String targetName = bondedDeviceName;
+
+        final CountDownLatch scanLatch = new CountDownLatch(1);
+        final BluetoothDevice[] exactMatch = new BluetoothDevice[1];
+        final BluetoothDevice[] nameMatch = new BluetoothDevice[1];
+
+        ScanCallback scanCallback = new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                BluetoothDevice device = result.getDevice();
+                if (device.getAddress().equals(targetAddress)) {
+                    Log.v(LOG_TAG, "BLE scan: exact MAC match: " + device.getAddress());
+                    exactMatch[0] = device;
+                    scanLatch.countDown();
+                } else if (targetName != null && targetName.equals(device.getName()) && nameMatch[0] == null) {
+                    Log.v(LOG_TAG, "BLE scan: name match: " + device.getName()
+                            + " at " + device.getAddress() + " (bonded MAC was " + targetAddress + ")");
+                    nameMatch[0] = device;
+                    scanLatch.countDown();
+                }
+            }
+
+            @Override
+            public void onScanFailed(int errorCode) {
+                Log.e(LOG_TAG, "BLE scan failed with error: " + errorCode);
+                scanLatch.countDown();
+            }
+        };
+
+        Log.v(LOG_TAG, "Starting BLE scan for device: " + targetAddress
+                + (targetName != null ? " (name: " + targetName + ")" : ""));
+        scanner.startScan(scanCallback);
+
+        try {
+            scanLatch.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Log.w(LOG_TAG, "BLE scan interrupted");
+        }
+
+        try {
+            scanner.stopScan(scanCallback);
+        } catch (Exception e) {
+            Log.w(LOG_TAG, "Error stopping BLE scan", e);
+        }
+
+        if (exactMatch[0] != null) {
+            Log.v(LOG_TAG, "Target device found via exact MAC match");
+            return exactMatch[0];
+        }
+        if (nameMatch[0] != null) {
+            Log.v(LOG_TAG, "Target device found via name match at BLE address: " + nameMatch[0].getAddress());
+            return nameMatch[0];
+        }
+
+        Log.w(LOG_TAG, "Target device NOT found via BLE scan");
+        return null;
+    }
+
+    private void closeGattIfExists() {
+        if (mBluetoothGatt != null) {
+            mBluetoothGatt.close();
+            mBluetoothGatt = null;
+        }
+        mWriteCharacteristic = null;
+        mGattConnected = false;
     }
 
     @Override
@@ -202,41 +439,90 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             e.printStackTrace();
         }
 
+        closeGattIfExists();
+
         if(this.mBluetoothDevice != null) {
             this.mBluetoothDevice = null;
         }
     }
 
-    @Override
-    public void printRawData(String rawBase64Data, Callback successCallback, Callback errorCallback) {
-        if(this.mBluetoothSocket == null){
-            errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
-            return;
-        }
-        final String rawData = rawBase64Data;
-        final BluetoothSocket socket = this.mBluetoothSocket;
-        Log.v(LOG_TAG, "start to print raw data " + rawBase64Data);
+    private void writeChunkedBleGatt(byte[] bytes, Callback successCallback, Callback errorCallback) {
+        final BluetoothGatt gatt = this.mBluetoothGatt;
+        final BluetoothGattCharacteristic characteristic = this.mWriteCharacteristic;
+        final int chunkSize = Math.max(mNegotiatedMtu - 3, 20);
+
+        Log.v(LOG_TAG, "Printing via BLE GATT, chunk size: " + chunkSize + ", total bytes: " + bytes.length);
+
         new Thread(new Runnable() {
             @Override
             public void run() {
-                byte [] bytes = Base64.decode(rawData, Base64.DEFAULT);
-                try{
-                    OutputStream printerOutputStream = socket.getOutputStream();
-                    printerOutputStream.write(bytes, 0, bytes.length);
-                    printerOutputStream.flush();
+                try {
+                    int writeType = ((characteristic.getProperties()
+                            & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0)
+                            ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                            : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+                    characteristic.setWriteType(writeType);
+
+                    for (int offset = 0; offset < bytes.length; offset += chunkSize) {
+                        int end = Math.min(offset + chunkSize, bytes.length);
+                        byte[] chunk = Arrays.copyOfRange(bytes, offset, end);
+                        characteristic.setValue(chunk);
+                        boolean ok = gatt.writeCharacteristic(characteristic);
+                        if (!ok) {
+                            Log.w(LOG_TAG, "writeCharacteristic returned false at offset " + offset);
+                        }
+                        Thread.sleep(100);
+                    }
                     if (successCallback != null) {
                         successCallback.invoke("Done");
                     }
-                }catch (IOException e){
-                    Log.e(LOG_TAG, "failed to print data" + rawData);
+                } catch (Exception e) {
+                    Log.e(LOG_TAG, "Failed to print data via BLE GATT");
                     e.printStackTrace();
                     if (errorCallback != null) {
-                        errorCallback.invoke("Error printing: " + e.getMessage());
+                        errorCallback.invoke("Error printing via BLE: " + e.getMessage());
                     }
                 }
-
             }
         }).start();
+    }
+
+    @Override
+    public void printRawData(String rawBase64Data, Callback successCallback, Callback errorCallback) {
+        if (this.mBluetoothSocket != null) {
+            final String rawData = rawBase64Data;
+            final BluetoothSocket socket = this.mBluetoothSocket;
+            Log.v(LOG_TAG, "Printing via RFCOMM");
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    byte[] bytes = Base64.decode(rawData, Base64.DEFAULT);
+                    try {
+                        OutputStream printerOutputStream = socket.getOutputStream();
+                        printerOutputStream.write(bytes, 0, bytes.length);
+                        printerOutputStream.flush();
+                        if (successCallback != null) {
+                            successCallback.invoke("Done");
+                        }
+                    } catch (IOException e) {
+                        Log.e(LOG_TAG, "Failed to print data via RFCOMM");
+                        e.printStackTrace();
+                        if (errorCallback != null) {
+                            errorCallback.invoke("Error printing: " + e.getMessage());
+                        }
+                    }
+                }
+            }).start();
+            return;
+        }
+
+        if (this.mBluetoothGatt != null && this.mWriteCharacteristic != null) {
+            byte[] bytes = Base64.decode(rawBase64Data, Base64.DEFAULT);
+            writeChunkedBleGatt(bytes, successCallback, errorCallback);
+            return;
+        }
+
+        errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
     }
 
     public static Bitmap getBitmapFromURL(String src) {
@@ -258,6 +544,28 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         }
     }
 
+    private byte[] renderImageToBytes(Bitmap bitmapImage, int imageWidth, int imageHeight) throws IOException {
+        int[][] pixels = getPixelsSlow(bitmapImage, imageWidth, imageHeight);
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+
+        buffer.write(SET_LINE_SPACE_24);
+        buffer.write(CENTER_ALIGN);
+
+        for (int y = 0; y < pixels.length; y += 24) {
+            buffer.write(SELECT_BIT_IMAGE_MODE);
+            buffer.write(new byte[]{(byte)(0x00ff & pixels[y].length),
+                    (byte)((0xff00 & pixels[y].length) >> 8)});
+            for (int x = 0; x < pixels[y].length; x++) {
+                buffer.write(recollectSlice(y, x, pixels));
+            }
+            buffer.write(LINE_FEED);
+        }
+        buffer.write(SET_LINE_SPACE_32);
+        buffer.write(LINE_FEED);
+
+        return buffer.toByteArray();
+    }
+
     @Override
     public void printImageData(String imageUrl, int  imageWidth, int imageHeight, Callback errorCallback) {
         final Bitmap bitmapImage = getBitmapFromURL(imageUrl);
@@ -267,44 +575,34 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             return;
         }
 
-        if (this.mBluetoothSocket == null) {
-            errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
+        if (this.mBluetoothSocket != null) {
+            final BluetoothSocket socket = this.mBluetoothSocket;
+            try {
+                byte[] imageBytes = renderImageToBytes(bitmapImage, imageWidth, imageHeight);
+                OutputStream printerOutputStream = socket.getOutputStream();
+                printerOutputStream.write(imageBytes);
+                printerOutputStream.flush();
+            } catch (IOException e) {
+                Log.e(LOG_TAG, "failed to print image data");
+                e.printStackTrace();
+                errorCallback.invoke("Error printing image: " + e.getMessage());
+            }
             return;
         }
 
-        final BluetoothSocket socket = this.mBluetoothSocket;
-
-        try {
-            int[][] pixels = getPixelsSlow(bitmapImage, imageWidth, imageHeight);
-
-            OutputStream printerOutputStream = socket.getOutputStream();
-
-            printerOutputStream.write(SET_LINE_SPACE_24);
-            printerOutputStream.write(CENTER_ALIGN);
-
-            for (int y = 0; y < pixels.length; y += 24) {
-                // Like I said before, when done sending data,
-                // the printer will resume to normal text printing
-                printerOutputStream.write(SELECT_BIT_IMAGE_MODE);
-                // Set nL and nH based on the width of the image
-                printerOutputStream.write(new byte[]{(byte)(0x00ff & pixels[y].length)
-                        , (byte)((0xff00 & pixels[y].length) >> 8)});
-                for (int x = 0; x < pixels[y].length; x++) {
-                    // for each stripe, recollect 3 bytes (3 bytes = 24 bits)
-                    printerOutputStream.write(recollectSlice(y, x, pixels));
-                }
-
-                // Do a line feed, if not the printing will resume on the same line
-                printerOutputStream.write(LINE_FEED);
+        if (this.mBluetoothGatt != null && this.mWriteCharacteristic != null) {
+            try {
+                byte[] imageBytes = renderImageToBytes(bitmapImage, imageWidth, imageHeight);
+                writeChunkedBleGatt(imageBytes, null, errorCallback);
+            } catch (IOException e) {
+                Log.e(LOG_TAG, "failed to render image data for BLE");
+                e.printStackTrace();
+                errorCallback.invoke("Error rendering image: " + e.getMessage());
             }
-            printerOutputStream.write(SET_LINE_SPACE_32);
-            printerOutputStream.write(LINE_FEED);
-
-            printerOutputStream.flush();
-        } catch (IOException e) {
-            Log.e(LOG_TAG, "failed to print data");
-            e.printStackTrace();
+            return;
         }
+
+        errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
     }
 
     @Override
@@ -314,43 +612,33 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             return;
         }
 
-        if (this.mBluetoothSocket == null) {
-            errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
+        if (this.mBluetoothSocket != null) {
+            final BluetoothSocket socket = this.mBluetoothSocket;
+            try {
+                byte[] imageBytes = renderImageToBytes(bitmapImage, imageWidth, imageHeight);
+                OutputStream printerOutputStream = socket.getOutputStream();
+                printerOutputStream.write(imageBytes);
+                printerOutputStream.flush();
+            } catch (IOException e) {
+                Log.e(LOG_TAG, "failed to print image base64");
+                e.printStackTrace();
+                errorCallback.invoke("Error printing image: " + e.getMessage());
+            }
             return;
         }
 
-        final BluetoothSocket socket = this.mBluetoothSocket;
-
-        try {
-            int[][] pixels = getPixelsSlow(bitmapImage, imageWidth, imageHeight);
-
-            OutputStream printerOutputStream = socket.getOutputStream();
-
-            printerOutputStream.write(SET_LINE_SPACE_24);
-            printerOutputStream.write(CENTER_ALIGN);
-
-            for (int y = 0; y < pixels.length; y += 24) {
-                // Like I said before, when done sending data,
-                // the printer will resume to normal text printing
-                printerOutputStream.write(SELECT_BIT_IMAGE_MODE);
-                // Set nL and nH based on the width of the image
-                printerOutputStream.write(new byte[]{(byte)(0x00ff & pixels[y].length)
-                        , (byte)((0xff00 & pixels[y].length) >> 8)});
-                for (int x = 0; x < pixels[y].length; x++) {
-                    // for each stripe, recollect 3 bytes (3 bytes = 24 bits)
-                    printerOutputStream.write(recollectSlice(y, x, pixels));
-                }
-
-                // Do a line feed, if not the printing will resume on the same line
-                printerOutputStream.write(LINE_FEED);
+        if (this.mBluetoothGatt != null && this.mWriteCharacteristic != null) {
+            try {
+                byte[] imageBytes = renderImageToBytes(bitmapImage, imageWidth, imageHeight);
+                writeChunkedBleGatt(imageBytes, null, errorCallback);
+            } catch (IOException e) {
+                Log.e(LOG_TAG, "failed to render image base64 for BLE");
+                e.printStackTrace();
+                errorCallback.invoke("Error rendering image: " + e.getMessage());
             }
-            printerOutputStream.write(SET_LINE_SPACE_32);
-            printerOutputStream.write(LINE_FEED);
-
-            printerOutputStream.flush();
-        } catch (IOException e) {
-            Log.e(LOG_TAG, "failed to print data");
-            e.printStackTrace();
+            return;
         }
+
+        errorCallback.invoke("bluetooth connection is not built, may be you forgot to connectPrinter");
     }
 }
