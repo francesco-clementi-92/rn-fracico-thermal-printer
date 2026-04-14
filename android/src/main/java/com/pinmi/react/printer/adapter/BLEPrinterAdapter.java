@@ -352,20 +352,8 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             return null;
         }
 
-        // Get the bonded device name to use as fallback matching
-        String bondedDeviceName = null;
-        Set<BluetoothDevice> bonded = adapter.getBondedDevices();
-        for (BluetoothDevice d : bonded) {
-            if (d.getAddress().equals(targetAddress)) {
-                bondedDeviceName = d.getName();
-                break;
-            }
-        }
-        final String targetName = bondedDeviceName;
-
         final CountDownLatch scanLatch = new CountDownLatch(1);
         final BluetoothDevice[] exactMatch = new BluetoothDevice[1];
-        final BluetoothDevice[] nameMatch = new BluetoothDevice[1];
 
         ScanCallback scanCallback = new ScanCallback() {
             @Override
@@ -374,11 +362,6 @@ public class BLEPrinterAdapter implements PrinterAdapter {
                 if (device.getAddress().equals(targetAddress)) {
                     Log.v(LOG_TAG, "BLE scan: exact MAC match: " + device.getAddress());
                     exactMatch[0] = device;
-                    scanLatch.countDown();
-                } else if (targetName != null && targetName.equals(device.getName()) && nameMatch[0] == null) {
-                    Log.v(LOG_TAG, "BLE scan: name match: " + device.getName()
-                            + " at " + device.getAddress() + " (bonded MAC was " + targetAddress + ")");
-                    nameMatch[0] = device;
                     scanLatch.countDown();
                 }
             }
@@ -390,8 +373,7 @@ public class BLEPrinterAdapter implements PrinterAdapter {
             }
         };
 
-        Log.v(LOG_TAG, "Starting BLE scan for device: " + targetAddress
-                + (targetName != null ? " (name: " + targetName + ")" : ""));
+        Log.v(LOG_TAG, "Starting BLE scan for device: " + targetAddress);
         scanner.startScan(scanCallback);
 
         try {
@@ -409,10 +391,6 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         if (exactMatch[0] != null) {
             Log.v(LOG_TAG, "Target device found via exact MAC match");
             return exactMatch[0];
-        }
-        if (nameMatch[0] != null) {
-            Log.v(LOG_TAG, "Target device found via name match at BLE address: " + nameMatch[0].getAddress());
-            return nameMatch[0];
         }
 
         Log.w(LOG_TAG, "Target device NOT found via BLE scan");
