@@ -341,7 +341,7 @@ public class BLEPrinterAdapter implements PrinterAdapter {
         });
 
         try {
-            if (!mGattConnectLatch.await(15, TimeUnit.SECONDS)) {
+            if (!mGattConnectLatch.await(5, TimeUnit.SECONDS)) {
                 closeGattIfExists();
                 throw new IOException("BLE GATT connection timed out");
             }
